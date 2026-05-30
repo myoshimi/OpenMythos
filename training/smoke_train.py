@@ -24,12 +24,21 @@ Differences from 3b_fine_web_edu.py and why:
   * Tiny budget — short seq_len, micro_batch 1, few recurrent loops, a few dozen
     steps — so it finishes in minutes.
 
-Run:
+Run (defaults are a ~1 minute single-GPU smoke test):
     python training/smoke_train.py
+
+Every hyperparameter is overridable from the CLI, so experiments need no file
+edits. Examples:
+    # sweep recurrent depth
+    python training/smoke_train.py --n-loops 8 --ckpt-dir ckpt_loops8
+    # longer context, more steps
+    python training/smoke_train.py --seq-len 1024 --max-steps 100
+    python training/smoke_train.py --help     # full list
 """
 
 import os
 import time
+import argparse
 import importlib.util
 
 import torch
@@ -37,8 +46,7 @@ import torch.nn as nn
 from loguru import logger
 from torch.utils.data import DataLoader
 
-from open_mythos import OpenMythos
-from open_mythos.variants import mythos_1b
+from open_mythos import OpenMythos, variants
 from open_mythos.tokenizer import MythosTokenizer
 
 
@@ -62,31 +70,64 @@ load_checkpoint = _pretrain.load_checkpoint
 _list_ckpts = _pretrain._list_ckpts
 
 
-# ---------------------------------------------------------------------------
-# Smoke-test hyperparameters — all deliberately tiny. Bump these to scale up.
-# ---------------------------------------------------------------------------
-SEQ_LEN = 512        # short context to keep activations small
-MICRO_BATCH = 1
-GRAD_ACCUM = 4       # global batch = 1 * 4 * 512 = 2048 tokens/step
-N_LOOPS = 4          # recurrent depth (mythos_1b default is 16; reduced for memory/speed)
-MAX_STEPS = 40
-WARMUP_STEPS = 5
-LOG_EVERY = 2
-CKPT_EVERY = 20
-LR = 3e-4
-WD = 0.1
-CKPT_DIR = "checkpoints_smoke"
-DATASET_SUBSET = "sample-10BT"
+# Variant factories exposed by open_mythos.variants (mythos_1b, mythos_3b, ...).
+# Only mythos_1b (and smaller custom configs) fit a single 24 GB card for
+# training; larger variants are listed for convenience but will OOM.
+_VARIANTS = sorted(n for n in dir(variants) if n.startswith("mythos_"))
 
 
-def main() -> None:
-    """Run a short single-GPU smoke train on streaming FineWeb-Edu."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def build_parser() -> argparse.ArgumentParser:
+    """CLI for the smoke test. Defaults reproduce the ~1 minute baseline run."""
+    p = argparse.ArgumentParser(
+        description="Single-GPU smoke test / experiment harness for OpenMythos "
+        "pretraining on streaming FineWeb-Edu.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--variant", choices=_VARIANTS, default="mythos_1b",
+                   help="model config factory from open_mythos.variants")
+    p.add_argument("--seq-len", type=int, default=512,
+                   help="context length; activations scale with this")
+    p.add_argument("--micro-batch", type=int, default=1)
+    p.add_argument("--grad-accum", type=int, default=4,
+                   help="global batch tokens = micro_batch * grad_accum * seq_len")
+    p.add_argument("--n-loops", type=int, default=4,
+                   help="recurrent loop depth (compute/memory scale ~linearly)")
+    p.add_argument("--max-steps", type=int, default=40)
+    p.add_argument("--warmup-steps", type=int, default=5)
+    p.add_argument("--log-every", type=int, default=2)
+    p.add_argument("--ckpt-every", type=int, default=20)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--wd", type=float, default=0.1)
+    p.add_argument("--ckpt-dir", default="checkpoints_smoke")
+    p.add_argument("--dataset-subset", default="sample-10BT",
+                   help="FineWeb-Edu config name (e.g. sample-10BT, default)")
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="DataLoader worker processes")
+    p.add_argument("--dtype", choices=["auto", "bf16", "fp32"], default="auto",
+                   help="param dtype; auto = bf16 if supported else fp32")
+    p.add_argument("--seed", type=int, default=0,
+                   help="torch manual seed for reproducible comparisons")
+    return p
+
+
+def resolve_dtype(choice: str) -> torch.dtype:
+    """Map --dtype to a torch dtype, honoring hardware bf16 support for 'auto'."""
+    if choice == "bf16":
+        return torch.bfloat16
+    if choice == "fp32":
+        return torch.float32
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    # bf16-native params to fit ~1.41B params + AdamW on a 24 GB card. fp16 is
-    # avoided (no GradScaler here); on non-bf16 GPUs fall back to fp32.
-    param_dtype = torch.bfloat16 if bf16_ok else torch.float32
-    logger.info(f"Device: {device} | param dtype: {param_dtype}")
+    return torch.bfloat16 if bf16_ok else torch.float32
+
+
+def main(args: argparse.Namespace) -> None:
+    """Run a short single-GPU smoke train on streaming FineWeb-Edu."""
+    torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    param_dtype = resolve_dtype(args.dtype)
+    logger.info(
+        f"Device: {device} | param dtype: {param_dtype} | seed: {args.seed}"
+    )
 
     # ------------------------------------------------------------------
     # Tokenizer
@@ -96,29 +137,29 @@ def main() -> None:
     logger.info(f"Tokenizer: gpt-oss-20b | vocab size: {vocab_size:,}")
 
     # ------------------------------------------------------------------
-    # Model (mythos_1b, shrunk loop depth, bf16-native to fit 24 GB)
+    # Model (selected variant, overridden seq_len / loop depth)
     # ------------------------------------------------------------------
-    cfg = mythos_1b()
+    cfg = getattr(variants, args.variant)()
     cfg.vocab_size = vocab_size
-    cfg.max_seq_len = SEQ_LEN
-    cfg.max_loop_iters = N_LOOPS
+    cfg.max_seq_len = args.seq_len
+    cfg.max_loop_iters = args.n_loops
 
     model = OpenMythos(cfg).to(device=device, dtype=param_dtype)
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Parameters: {n_params:,} ({n_params / 1e9:.2f}B)")
+    logger.info(f"Model: {args.variant} | params: {n_params:,} ({n_params / 1e9:.2f}B)")
 
-    global_batch_tok = MICRO_BATCH * GRAD_ACCUM * SEQ_LEN
+    global_batch_tok = args.micro_batch * args.grad_accum * args.seq_len
     logger.info(
-        f"seq_len={SEQ_LEN} | micro_batch={MICRO_BATCH} | grad_accum={GRAD_ACCUM} "
-        f"| n_loops={N_LOOPS} | global_batch_tokens={global_batch_tok:,} "
-        f"| max_steps={MAX_STEPS}"
+        f"seq_len={args.seq_len} | micro_batch={args.micro_batch} "
+        f"| grad_accum={args.grad_accum} | n_loops={args.n_loops} "
+        f"| global_batch_tokens={global_batch_tok:,} | max_steps={args.max_steps}"
     )
 
-    # fused AdamW needs CUDA; states inherit the bf16 param dtype.
+    # fused AdamW needs CUDA; states inherit the param dtype.
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR,
-        weight_decay=WD,
+        lr=args.lr,
+        weight_decay=args.wd,
         betas=(0.9, 0.95),
         fused=(device == "cuda"),
     )
@@ -127,10 +168,11 @@ def main() -> None:
     # Streaming dataset (real FineWeb-Edu, pulled on demand)
     # ------------------------------------------------------------------
     dataset = FineWebEduDataset(
-        encoding, SEQ_LEN, DATASET_SUBSET, rank=0, world_size=1
+        encoding, args.seq_len, args.dataset_subset, rank=0, world_size=1
     )
     loader = DataLoader(
-        dataset, batch_size=MICRO_BATCH, num_workers=2, pin_memory=True
+        dataset, batch_size=args.micro_batch,
+        num_workers=args.num_workers, pin_memory=True,
     )
 
     # ------------------------------------------------------------------
@@ -141,15 +183,15 @@ def main() -> None:
     t0 = time.perf_counter()
     last_loss = float("nan")
 
-    for step in range(1, MAX_STEPS + 1):
-        cur_lr = get_lr(step, WARMUP_STEPS, MAX_STEPS, LR, LR * 0.1)
+    for step in range(1, args.max_steps + 1):
+        cur_lr = get_lr(step, args.warmup_steps, args.max_steps, args.lr, args.lr * 0.1)
         for g in optimizer.param_groups:
             g["lr"] = cur_lr
 
         optimizer.zero_grad()
         loss_accum = 0.0
 
-        for _ in range(GRAD_ACCUM):
+        for _ in range(args.grad_accum):
             try:
                 x, y = next(data_iter)
             except StopIteration:
@@ -165,7 +207,7 @@ def main() -> None:
             loss = nn.functional.cross_entropy(
                 logits.float().view(-1, vocab_size), y.view(-1)
             )
-            loss = loss / GRAD_ACCUM
+            loss = loss / args.grad_accum
             loss.backward()
             loss_accum += loss.item()
 
@@ -173,19 +215,19 @@ def main() -> None:
         optimizer.step()
         last_loss = loss_accum
 
-        if step % LOG_EVERY == 0:
+        if step % args.log_every == 0:
             dt = time.perf_counter() - t0
-            tok_per_sec = global_batch_tok * LOG_EVERY / dt
+            tok_per_sec = global_batch_tok * args.log_every / dt
             logger.info(
-                f"step {step:3d}/{MAX_STEPS} | loss {loss_accum:.4f} "
+                f"step {step:3d}/{args.max_steps} | loss {loss_accum:.4f} "
                 f"| gnorm {float(grad_norm):.2f} | lr {cur_lr:.2e} "
                 f"| {tok_per_sec:,.0f} tok/s"
             )
             t0 = time.perf_counter()
 
-        if step % CKPT_EVERY == 0:
+        if step % args.ckpt_every == 0:
             save_checkpoint(
-                model, optimizer, step, cfg, vocab_size, CKPT_DIR,
+                model, optimizer, step, cfg, vocab_size, args.ckpt_dir,
                 ddp=False, master=True,
             )
 
@@ -194,16 +236,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     assert torch.isfinite(torch.tensor(last_loss)), f"non-finite loss: {last_loss}"
 
-    ckpts = _list_ckpts(CKPT_DIR)
-    assert ckpts, f"no checkpoint written to {CKPT_DIR}/"
+    ckpts = _list_ckpts(args.ckpt_dir)
+    assert ckpts, f"no checkpoint written to {args.ckpt_dir}/"
     # Reload the latest checkpoint into a fresh model/optimizer to confirm the
     # save/load round-trip works (the part most likely to silently break).
     fresh = OpenMythos(cfg).to(device=device, dtype=param_dtype)
-    fresh_opt = torch.optim.AdamW(fresh.parameters(), lr=LR, fused=(device == "cuda"))
-    resumed_step = load_checkpoint(fresh, fresh_opt, ckpts[-1], ddp=False)
-    logger.success(
-        f"Checkpoint round-trip OK ({ckpts[-1]}, step {resumed_step})"
+    fresh_opt = torch.optim.AdamW(
+        fresh.parameters(), lr=args.lr, fused=(device == "cuda")
     )
+    resumed_step = load_checkpoint(fresh, fresh_opt, ckpts[-1], ddp=False)
+    logger.success(f"Checkpoint round-trip OK ({ckpts[-1]}, step {resumed_step})")
 
     if device == "cuda":
         logger.info(
@@ -213,4 +255,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(build_parser().parse_args())
