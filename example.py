@@ -2,6 +2,9 @@ import torch
 from open_mythos.main import OpenMythos, MythosConfig
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
 attn_type = "mla"  # or "gqa"
 
 base = {
@@ -33,11 +36,11 @@ else:
         v_head_dim=16,
     )
 
-model = OpenMythos(cfg)
+model = OpenMythos(cfg).to(device)
 total = sum(p.numel() for p in model.parameters())
 print(f"\n[{attn_type.upper()}] Parameters: {total:,}")
 
-ids = torch.randint(0, cfg.vocab_size, (2, 16))
+ids = torch.randint(0, cfg.vocab_size, (2, 16), device=device)
 logits = model(ids, n_loops=4)
 print(f"[{attn_type.upper()}] Logits shape: {logits.shape}")
 
