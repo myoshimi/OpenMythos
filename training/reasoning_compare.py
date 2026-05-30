@@ -63,9 +63,37 @@ sys.modules["small_benchmark"] = _bench
 _spec.loader.exec_module(_bench)
 
 BaselineTransformer = _bench.BaselineTransformer
-build_tiny_cfg = _bench.build_tiny_cfg
 
-from open_mythos import OpenMythos  # noqa: E402
+from open_mythos import OpenMythos, MythosConfig  # noqa: E402
+
+
+def build_cfg(vocab_size: int, seq_len: int, args) -> MythosConfig:
+    """Shared GQA config for both models, sized by the CLI --dim / layer flags.
+
+    GQA (not MLA) is used for the scaled comparison so the size knobs are a
+    single clean axis (dim, heads, layers) rather than the interdependent MLA
+    rank/head-dim budget. Both models use the identical attention, so the
+    comparison still isolates recurrent depth.
+    """
+    expert_dim = args.expert_dim if args.expert_dim > 0 else args.dim
+    return MythosConfig(
+        vocab_size=vocab_size,
+        dim=args.dim,
+        n_heads=args.n_heads,
+        n_kv_heads=args.n_kv_heads,
+        max_seq_len=seq_len,
+        max_loop_iters=args.train_loops_max,
+        prelude_layers=args.prelude_layers,
+        coda_layers=args.coda_layers,
+        attn_type="gqa",
+        n_experts=args.n_experts,
+        n_shared_experts=1,
+        n_experts_per_tok=2,
+        expert_dim=expert_dim,
+        lora_rank=args.lora_rank,
+        rope_theta=10000.0,
+        dropout=0.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +249,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--k", type=int, default=5,
                    help="permutation size; vocab = k! (k=5 → 120, the classic hard case)")
+    # --- model size (shared by both models) ---
+    p.add_argument("--dim", type=int, default=512)
+    p.add_argument("--n-heads", type=int, default=8)
+    p.add_argument("--n-kv-heads", type=int, default=2)
+    p.add_argument("--prelude-layers", type=int, default=1)
+    p.add_argument("--coda-layers", type=int, default=1)
+    p.add_argument("--n-experts", type=int, default=4)
+    p.add_argument("--expert-dim", type=int, default=0,
+                   help="MoE expert hidden dim; 0 = use --dim")
+    p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--train-min-len", type=int, default=3)
     p.add_argument("--train-max-len", type=int, default=12,
                    help="train on chains of this many permutations and shorter")
@@ -259,12 +297,11 @@ def main(args: argparse.Namespace) -> None:
     )
     print(f"[setup] device={device} | steps={args.steps} | batch={args.batch_size}")
 
-    # Shared tiny config; seq_len budget must cover the longest eval length.
-    cfg = build_tiny_cfg(task.vocab_size, max_len)
-    # max_loop_iters bounds the LoRA depth adapters / loop embeddings; set it to
-    # the largest depth used in training. Test-time loops beyond this are clamped
+    # Shared config; seq_len budget must cover the longest eval length.
+    # max_loop_iters bounds the LoRA depth adapters / loop embeddings; build_cfg
+    # sets it to args.train_loops_max. Test-time loops beyond this are clamped
     # internally (depth extrapolation).
-    cfg.max_loop_iters = args.train_loops_max
+    cfg = build_cfg(task.vocab_size, max_len, args)
 
     torch.manual_seed(args.seed)
     mythos = OpenMythos(cfg).to(device)

@@ -11,12 +11,15 @@ single consumer GPU (NVIDIA RTX 4090, 24 GB), against a **parameter-matched
 vanilla Transformer** built from the same attention/FFN kernels. Results are
 reported as measured, including where OpenMythos does *not* win.
 
-> **TL;DR.** At this scale (dim=128, ~0.7 M params, minutes of training) we did
-> **not** observe a recurrent-depth advantage. A same-size (or larger) vanilla
-> Transformer matched or beat OpenMythos on both an easy language task and a
-> depth-bound reasoning task, and the "think longer" (depth-extrapolation)
-> effect did not appear. See [Interpretation](#interpretation) for why this is a
-> reasonable — not surprising — outcome.
+> **TL;DR.** Scale matters. At **~0.7 M params** (dim=128) we saw *no*
+> recurrent-depth advantage — both models underfit even the in-distribution
+> task. At **~9 M params** (dim=512) the picture changes: on the depth-bound
+> reasoning task OpenMythos **beats** a same-size vanilla Transformer on the hard
+> trained length (85.6 % vs 74.8 %), and "thinking longer" clearly helps
+> (accuracy climbs 27 % → 72 % → 85 % as loops go 1 → 2 → 4). What still does
+> **not** work at any scale we tried: generalizing to *unseen longer* chains, and
+> extrapolating *beyond* the trained loop count. See
+> [How big does it need to be?](#how-big-does-it-need-to-be) for realistic sizing.
 
 ---
 
@@ -101,31 +104,111 @@ Params: **OpenMythos 684 k vs Baseline 752 k (5 layers)** — baseline is larger
 | 8 (trained) | 95.8 % | 8.3 % | 4.6 % | 4.6 % | 4.8 % |
 | 32 | 93.3 % | 8.8 % | 4.2 % | 5.2 % | 4.8 % |
 
-**Outcome:** the (larger) baseline matched or beat OpenMythos at every length;
-neither model generalized to unseen lengths; and looping more produced **no
-improvement** — the depth-extrapolation effect did not appear.
+**Outcome (at 0.7 M):** the (larger) baseline matched or beat OpenMythos at every
+length; neither model generalized to unseen lengths; and looping more produced
+**no improvement**. But note both models also failed the *trained* length 8
+(8.3 % / 52.7 %) — i.e. they underfit. That motivated scaling up.
+
+---
+
+## Experiment 3 — Same task, bigger models (≈9 M params)
+
+Identical task and protocol, but with `--dim 512` (GQA), giving **OpenMythos
+8.81 M vs Baseline 8.53 M params** (baseline still ≥ OpenMythos), trained 8000
+steps.
+
+```
+python training/reasoning_compare.py --k 4 --dim 512 --steps 8000 \
+    --train-min-len 3 --train-max-len 8 --eval-lens 4,8,12,16,24 \
+    --train-loops-min 1 --train-loops-max 8 --depth-sweep 1,2,4,8,16,32
+```
+
+**Exact-match accuracy** (random ≈ 4.2 %):
+
+| Chain length | OpenMythos | Baseline | |
+|---|---|---|---|
+| 4 (trained) | 100.0 % | 99.8 % | both solve it |
+| 8 (trained) | **85.6 %** | 74.8 % | **OpenMythos wins** |
+| 12 (unseen) | 4.0 % | 3.5 % | both ≈ random |
+| 16 (unseen) | 4.8 % | 3.3 % | both ≈ random |
+| 24 (unseen) | 3.7 % | 4.3 % | both ≈ random |
+
+**Depth sweep — "thinking longer" now clearly helps (L=8):**
+
+| n_loops | 1 | 2 | 4 | 8 (trained) | 16 | 32 |
+|---|---|---|---|---|---|---|
+| accuracy | 26.6 % | 72.0 % | 85.5 % | 85.6 % | 85.7 % | 85.7 % |
+
+**Outcome (at 9 M):** two of the three hoped-for effects now appear —
+(1) OpenMythos **beats the same-size baseline** on the hard trained length, and
+(2) **more loops → higher accuracy** within the trained range, then a stable
+plateau (no collapse) when looped past the trained depth. Still absent:
+generalization to *unseen longer* chains (length ≥ 12), and *gains* from looping
+beyond the trained maximum.
+
+---
+
+## How big does it need to be?
+
+From the literature plus the experiments above, the realistic size depends
+entirely on what kind of demonstration you want.
+
+**For an algorithmic / reasoning demo (puzzles like this one): ~10 M params.**
+- Looped-transformer work uses small GPT-2-scale blocks for parity/addition.
+- Our own runs: 0.7 M underfits; **~9 M is enough** to show OpenMythos beating a
+  same-size Transformer and to show "thinking longer" helping. Trains on one
+  RTX 4090 in ~10 minutes.
+
+**For a real-language demo (compare to current LLMs on text): ~3.5 B params.**
+- Geiping et al. 2025 (the recurrent-depth architecture OpenMythos reconstructs)
+  use **3.5 B params / 800 B tokens**; test-time looping scales reasoning up to a
+  compute load "equivalent to 50 B parameters." Their model `huginn-0125` has the
+  *same* prelude → recurrent core → coda structure as OpenMythos.
+- **Training at this scale needs a cluster, not a single 4090** (consistent with
+  `mythos_3b` OOMing for training on 24 GB). But the released 3.5 B weights are
+  **bf16 ≈ 7 GB and run inference on a 4090** — you can vary recurrent steps
+  (4–64) to demonstrate test-time "thinking longer" on real prompts without
+  training anything.
+
+**On length generalization (still unsolved here):** the looped-transformer
+length-generalization results rely on specific design choices — NoPE (no
+positional encoding), curriculum, adaptive halting, RASP-L-style tasks — not just
+scale. OpenMythos (RoPE, fixed scheme) not generalizing to longer chains is
+consistent with that: it is a training/architecture issue, not only a size issue.
+
+### Sources
+- [Geiping et al. 2025 — Scaling up Test-Time Compute with Latent Reasoning (arXiv:2502.05171)](https://arxiv.org/abs/2502.05171)
+- [huginn-0125 — released 3.5 B recurrent-depth model (HuggingFace)](https://huggingface.co/tomg-group-umd/huginn-0125)
+- [Looped Transformers for Length Generalization (arXiv:2409.15647)](https://arxiv.org/abs/2409.15647)
+- [Universal Transformers Need Memory (arXiv:2604.21999)](https://arxiv.org/abs/2604.21999)
 
 ---
 
 ## Interpretation
 
-The recurrent-depth advantage did **not** materialize at this scale. This is a
-reasonable outcome rather than a bug:
+The recurrent-depth advantage is **scale-dependent and partial**. At 9 M params
+OpenMythos beats a same-size baseline on the hard task and "thinking longer"
+helps — but generalizing to unseen longer chains, and gaining from loops *past*
+the trained depth, did not appear at any scale we tried. This is a reasonable
+outcome rather than a bug:
 
-1. **Length generalization is an open research problem.** Even purpose-built
+1. **Scale gates the effect.** At 0.7 M both models underfit and there was no
+   advantage; at 9 M the advantage and the depth effect emerge. So the earlier
+   null result was largely a capacity/underfitting problem, not evidence against
+   the architecture.
+2. **Length generalization is an open research problem.** Even purpose-built
    looped/universal Transformers usually fail to extrapolate to unseen sequence
-   lengths without specialized techniques; a few minutes of training on a tiny
-   model is not expected to crack it.
-2. **Depth extrapolation needs more than random-loop training.** Producing the
-   right answer at more loops than trained is delicate; our attempt (randomizing
-   loops 1–8 during training) was not enough to induce it here.
-3. **Scale.** dim=128 / ~0.7 M params is far below where emergent
-   reasoning/depth benefits are typically reported.
+   lengths without specialized techniques (NoPE, curriculum, adaptive halting,
+   RASP-L tasks); a few minutes of training is not expected to crack it.
+3. **Depth extrapolation needs more than random-loop training.** Getting *gains*
+   at more loops than trained is delicate; randomizing loops 1–8 was enough for
+   the model to *use* depth (1→4 loops helped) and to stay *stable* past the
+   trained depth, but not to keep improving beyond it.
 4. **It is a reconstruction.** Per the project README, OpenMythos is "an
    independent, community-driven theoretical reconstruction based solely on
-   publicly available research and speculation." The theorized
-   depth-extrapolation property may simply not be realized by this
-   implementation at this scale.
+   publicly available research and speculation," modelled on a 3.5 B-scale design
+   (see [How big does it need to be?](#how-big-does-it-need-to-be)); some
+   properties likely need that scale and its training recipe to appear.
 
 **What this does *not* claim:** that recurrent-depth Transformers are useless, or
 that OpenMythos would not benefit from scale. It claims only what was measured:
