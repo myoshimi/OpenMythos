@@ -106,15 +106,19 @@ class BaselineTransformer(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
 
     @staticmethod
-    def _causal_mask(T: int, device: torch.device) -> torch.Tensor:
-        mask = torch.full((1, 1, T, T), float("-inf"), device=device)
+    def _causal_mask(
+        T: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # Match the activation dtype: a float32 mask added to bf16 attention
+        # scores would upcast them and collide with bf16 value tensors.
+        mask = torch.full((1, 1, T, T), float("-inf"), device=device, dtype=dtype)
         return torch.triu(mask, diagonal=1)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         T = input_ids.shape[1]
         x = self.embed(input_ids)
         freqs_cis = self.freqs_cis[:T]
-        mask = self._causal_mask(T, x.device) if T > 1 else None
+        mask = self._causal_mask(T, x.device, x.dtype) if T > 1 else None
         for i, layer in enumerate(self.layers):
             x = layer(x, freqs_cis, mask, cache_key=f"layer_{i}")
         return self.head(self.norm(x))
