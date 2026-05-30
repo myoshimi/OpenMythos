@@ -206,8 +206,9 @@ def train_one(model, task, args, device, gen, label):
             logits = model(ids, n_loops=nl)
         else:
             logits = model(ids)
+        # Loss in fp32 for numerical safety when params are bf16.
         loss = F.cross_entropy(
-            logits.reshape(-1, task.vocab_size), targets.reshape(-1)
+            logits.reshape(-1, task.vocab_size).float(), targets.reshape(-1)
         )
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -279,7 +280,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--dtype", choices=["auto", "bf16", "fp32"], default="auto",
+                   help="param dtype; auto = bf16 on CUDA (needed for 0.5B+), else fp32")
     return p
+
+
+def resolve_dtype(choice: str) -> torch.dtype:
+    """Map --dtype to a torch dtype; 'auto' uses bf16 on bf16-capable CUDA."""
+    if choice == "bf16":
+        return torch.bfloat16
+    if choice == "fp32":
+        return torch.float32
+    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    return torch.bfloat16 if bf16_ok else torch.float32
 
 
 def main(args: argparse.Namespace) -> None:
@@ -303,8 +316,9 @@ def main(args: argparse.Namespace) -> None:
     # internally (depth extrapolation).
     cfg = build_cfg(task.vocab_size, max_len, args)
 
+    param_dtype = resolve_dtype(args.dtype)
     torch.manual_seed(args.seed)
-    mythos = OpenMythos(cfg).to(device)
+    mythos = OpenMythos(cfg).to(device=device, dtype=param_dtype)
     n_m = sum(p.numel() for p in mythos.parameters())
 
     if args.baseline_layers == "auto":
@@ -312,12 +326,14 @@ def main(args: argparse.Namespace) -> None:
     else:
         baseline_layers = int(args.baseline_layers)
     torch.manual_seed(args.seed)
-    baseline = BaselineTransformer(cfg, n_layers=baseline_layers).to(device)
+    baseline = BaselineTransformer(cfg, n_layers=baseline_layers).to(
+        device=device, dtype=param_dtype
+    )
     n_b = sum(p.numel() for p in baseline.parameters())
     print(
-        f"[setup] OpenMythos params={n_m:,} "
-        f"(trains at {args.train_loops_min}..{args.train_loops_max} loops) | "
-        f"Baseline params={n_b:,} ({baseline_layers} fixed layers)"
+        f"[setup] dtype={param_dtype} | OpenMythos params={n_m:,} ({n_m / 1e6:.1f}M, "
+        f"trains at {args.train_loops_min}..{args.train_loops_max} loops) | "
+        f"Baseline params={n_b:,} ({n_b / 1e6:.1f}M, {baseline_layers} fixed layers)"
     )
 
     # Same data stream for both: re-seed the generator before each model so they
@@ -366,6 +382,9 @@ def main(args: argparse.Namespace) -> None:
             row += f"{acc:>9.1%} "
         marker = "  ←trained" if nl == cfg.max_loop_iters else ""
         print(row + marker)
+
+    if device.type == "cuda":
+        print(f"\n[mem] peak GPU memory: {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
 
 
 if __name__ == "__main__":
