@@ -855,7 +855,11 @@ class RecurrentBlock(nn.Module):
         B, T, D = h.shape
 
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
-        cumulative_p = torch.zeros(B, T, device=h.device)
+        # Match h's dtype so the ACT-weighted accumulation below stays in the
+        # model's compute dtype. Defaulting to float32 here would promote h_out
+        # to float32 and collide with bf16/fp16 weights in the downstream Coda
+        # when training in low precision without autocast.
+        cumulative_p = torch.zeros(B, T, device=h.device, dtype=h.dtype)
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
@@ -880,10 +884,10 @@ class RecurrentBlock(nn.Module):
                 remainder,
                 p,
             )
-            weight = weight * still_running.float()
+            weight = weight * still_running.to(h.dtype)
             h_out = h_out + weight.unsqueeze(-1) * h
 
-            cumulative_p = cumulative_p + p * still_running.float()
+            cumulative_p = cumulative_p + p * still_running.to(h.dtype)
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
             # Only short-circuit when there is no KV cache to keep consistent.
