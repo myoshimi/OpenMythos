@@ -148,6 +148,38 @@ beyond the trained maximum.
 
 ---
 
+## Experiment 4 — A readable string-in / string-out task (addition)
+
+For a demo that reads and writes plain text, `training/string_add.py` trains the
+same two models on **character-level addition**: read `"68+47="`, write `"115"`
+(answer emitted least-significant-digit-first for left-to-right learnability).
+
+At dim=512 (~9 M params), trained on ≤4-digit sums:
+
+| Digits | OpenMythos | Baseline | |
+|---|---|---|---|
+| 3 (trained) | 100.0 % | 99.7 % | both solve it |
+| 4 (trained) | 98.2 % | 99.4 % | both solve it |
+| 6 / 8 (unseen) | 0.0 % | 0.0 % | neither generalizes |
+
+The string I/O works cleanly in-distribution:
+
+```
+2629 + 8359 = 10988   model: 10988   OK
+8374 + 8502 = 16876   model: 16876   OK
+```
+
+**But addition shows no recurrent-depth advantage** — both models solve it, and
+the loop-count sweep is flat (1 loop = 8 loops = 16 loops). Per-digit addition is
+not depth-bottlenecked the way permutation composition is: each output digit is a
+shallow function of two digits plus a carry, so a fixed-depth model handles it
+fine. This is a useful contrast — the looping advantage is **task-specific**
+(it appears on sequential state-tracking, not on every task) — and a reminder
+that a clear string demo and a clear *depth* demo are best served by different
+tasks.
+
+---
+
 ## How big does it need to be?
 
 From the literature plus the experiments above, the realistic size depends
